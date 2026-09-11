@@ -1,38 +1,43 @@
-import finnhub
+import yfinance as yf
 import pandas as pd
 import numpy as np
 from ta.momentum import RSIIndicator, StochasticOscillator
 from ta.trend import MACD
-from datetime import datetime, timedelta
 
 class StockAnalyzer:
-    def __init__(self, api_key: str):
-        self.client = finnhub.Client(api_key=api_key)
+    def __init__(self, api_key: str = None):
+        self.api_key = api_key
 
-    def get_stock_data(self, symbol: str, resolution: str = "D", days_back: int = 100) -> pd.DataFrame:
+    def get_stock_data(self, symbol: str, timeframe: str = "1d", period: str = "60d") -> pd.DataFrame:
         """
-        Haalt candle data op via Finnhub.
-        resolution: '1', '5', '15', '30', '60', 'D', 'W', 'M'
+        Haalt candle data op via yfinance om Finnhub 403/API-limiet restricties te omzeilen.
+        timeframe: '5m', '15m', '30m', '1d'
         """
-        to_time = int(datetime.now().timestamp())
-        from_time = int((datetime.now() - timedelta(days=days_back)).timestamp())
+        try:
+            ticker = yf.Ticker(symbol)
+            # Pas period aan op basis van interval ivm yfinance limieten
+            if timeframe in ['5m', '15m', '30m']:
+                period = '7d'
+            
+            df = ticker.history(period=period, interval=timeframe)
 
-        res = self.client.stock_candles(symbol, resolution, from_time, to_time)
-        
-        if res.get('s') != 'ok':
+            if df.empty:
+                return pd.DataFrame()
+
+            df = df.reset_index()
+            
+            # Kolomnamen uniform maken
+            time_col = 'Datetime' if 'Datetime' in df.columns else 'Date'
+            df = df.rename(columns={time_col: 'Timestamp'})
+            
+            # Tijdszone verwijderen indien aanwezig voor strakke verwerking
+            if hasattr(df['Timestamp'].dt, 'tz_localize'):
+                df['Timestamp'] = df['Timestamp'].dt.tz_localize(None)
+
+            return self._calculate_indicators(df)
+        except Exception as e:
+            print(f"Fout bij ophalen data voor {symbol}: {e}")
             return pd.DataFrame()
-
-        df = pd.DataFrame({
-            'Timestamp': pd.to_datetime(res['t'], unit='s'),
-            'Open': res['o'],
-            'High': res['h'],
-            'Low': res['l'],
-            'Close': res['c'],
-            'Volume': res['v']
-        })
-        
-        # Bereken de indicatoren volgens jouw instructies
-        return self._calculate_indicators(df)
 
     def _calculate_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
         if df.empty or len(df) < 26:
@@ -55,39 +60,31 @@ class StockAnalyzer:
 
         # 4. Volume Analyse
         df['Vol_SMA20'] = df['Volume'].rolling(window=20).mean()
-        df['High_Volume'] = df['Volume'] > (df['Vol_SMA20'] * 1.5)
 
-        # 5. Signalen genereren op de meest recente candle
+        # 5. Kruisingen
         df['STO_Cross_Up'] = (df['Stoch_K'] > df['Stoch_D']) & (df['Stoch_K'].shift(1) <= df['Stoch_D'].shift(1))
         df['MACD_Cross_Up'] = (df['MACD'] > df['MACD_Signal']) & (df['MACD'].shift(1) <= df['MACD_Signal'].shift(1))
 
         return df
 
     def evaluate_signals(self, df: pd.DataFrame) -> dict:
-        """Evalueert de geselecteerde regels uit je handleiding op het meest recente datapunt."""
         if df.empty or len(df) < 2:
             return {"status": "Geen data beschikbaar"}
 
         latest = df.iloc[-1]
         prev = df.iloc[-2]
 
-        # STO kruising
         sto_bullish = latest['Stoch_K'] > latest['Stoch_D'] and prev['Stoch_K'] <= prev['Stoch_D']
         sto_status = "BULLISH CROSS" if sto_bullish else ("BULLISH" if latest['Stoch_K'] > latest['Stoch_D'] else "BEARISH")
 
-        # MACD kruising
         macd_bullish = latest['MACD'] > latest['MACD_Signal'] and prev['MACD'] <= prev['MACD_Signal']
         macd_status = "BULLISH CROSS" if macd_bullish else ("BULLISH" if latest['MACD'] > latest['MACD_Signal'] else "BEARISH")
 
-        # RSI Overbought Check
         rsi_overbought = latest['RSI'] > 70
-        rsi_oversold = latest['RSI'] < 30
-
-        # Volume Bevestiging
-        vol_strong = latest['Volume'] > latest['Vol_SMA20'] * 1.5
+        vol_avg = latest['Vol_SMA20'] if not pd.isna(latest['Vol_SMA20']) else 1
+        vol_strong = latest['Volume'] > vol_avg * 1.5
         price_change_pct = ((latest['Close'] - prev['Close']) / prev['Close']) * 100
 
-        # Totale Conclusie
         score = 0
         reasons = []
 
@@ -112,8 +109,7 @@ class StockAnalyzer:
             "Price": latest['Close'],
             "Change_Pct": round(price_change_pct, 2),
             "Volume": latest['Volume'],
-            "Volume_Avg": round(latest['Vol_SMA20'], 0),
-            "RSI": round(latest['RSI'], 1),
+            "RSI": round(latest['RSI'], 1) if not pd.isna(latest['RSI']) else 0,
             "STO_Status": sto_status,
             "MACD_Status": macd_status,
             "RSI_Overbought": rsi_overbought,
