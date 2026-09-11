@@ -3,21 +3,17 @@ import pandas as pd
 import numpy as np
 from ta.momentum import RSIIndicator, StochasticOscillator
 from ta.trend import MACD
+from sklearn.ensemble import RandomForestClassifier
 
 class StockAnalyzer:
     def __init__(self, api_key: str = None):
         self.api_key = api_key
 
-    def get_stock_data(self, symbol: str, timeframe: str = "1d", period: str = "60d") -> pd.DataFrame:
-        """
-        Haalt candle data op via yfinance om Finnhub 403/API-limiet restricties te omzeilen.
-        timeframe: '5m', '15m', '30m', '1d'
-        """
+    def get_stock_data(self, symbol: str, timeframe: str = "1d", period: str = "1y") -> pd.DataFrame:
         try:
             ticker = yf.Ticker(symbol)
-            # Pas period aan op basis van interval ivm yfinance limieten
             if timeframe in ['5m', '15m', '30m']:
-                period = '7d'
+                period = '1mo'
             
             df = ticker.history(period=period, interval=timeframe)
 
@@ -25,12 +21,9 @@ class StockAnalyzer:
                 return pd.DataFrame()
 
             df = df.reset_index()
-            
-            # Kolomnamen uniform maken
             time_col = 'Datetime' if 'Datetime' in df.columns else 'Date'
             df = df.rename(columns={time_col: 'Timestamp'})
             
-            # Tijdszone verwijderen indien aanwezig voor strakke verwerking
             if hasattr(df['Timestamp'].dt, 'tz_localize'):
                 df['Timestamp'] = df['Timestamp'].dt.tz_localize(None)
 
@@ -47,25 +40,66 @@ class StockAnalyzer:
         rsi_ind = RSIIndicator(close=df['Close'], window=14)
         df['RSI'] = rsi_ind.rsi()
 
-        # 2. Slow Stochastic Oscillator (Slow-Sto)
+        # 2. Slow Stochastic Oscillator
         stoch = StochasticOscillator(high=df['High'], low=df['Low'], close=df['Close'], window=14, smooth_window=3)
         df['Stoch_K'] = stoch.stoch()
         df['Stoch_D'] = stoch.stoch_signal()
 
-        # 3. MACD (12, 26, 9)
+        # 3. MACD
         macd_ind = MACD(close=df['Close'])
         df['MACD'] = macd_ind.macd()
         df['MACD_Signal'] = macd_ind.macd_signal()
         df['MACD_Hist'] = macd_ind.macd_diff()
 
-        # 4. Volume Analyse
+        # 4. Volume Features
         df['Vol_SMA20'] = df['Volume'].rolling(window=20).mean()
+        df['Vol_Ratio'] = df['Volume'] / (df['Vol_SMA20'] + 1e-9)
 
-        # 5. Kruisingen
-        df['STO_Cross_Up'] = (df['Stoch_K'] > df['Stoch_D']) & (df['Stoch_K'].shift(1) <= df['Stoch_D'].shift(1))
-        df['MACD_Cross_Up'] = (df['MACD'] > df['MACD_Signal']) & (df['MACD'].shift(1) <= df['MACD_Signal'].shift(1))
+        # 5. Price Returns
+        df['Return'] = df['Close'].pct_change()
 
-        return df
+        return df.dropna().reset_index(drop=True)
+
+    def predict_ml_probability(self, df: pd.DataFrame, forecast_horizon: int = 3) -> dict:
+        """
+        Traint een Random Forest Classifier om de waarschijnlijkheid van een prijsstijging
+        in de komende 'forecast_horizon' candles te voorspellen.
+        """
+        if df.empty or len(df) < 60:
+            return {"up_prob": 50.0, "status": "Onvoldoende data voor ML"}
+
+        # Target aanmaken: 1 als de prijs over N candles hoger is, anders 0
+        data = df.copy()
+        data['Target'] = (data['Close'].shift(-forecast_horizon) > data['Close']).astype(int)
+
+        # Features selecteren
+        feature_cols = ['RSI', 'Stoch_K', 'Stoch_D', 'MACD', 'MACD_Signal', 'MACD_Hist', 'Vol_Ratio', 'Return']
+        
+        X = data[feature_cols].iloc[:-forecast_horizon]
+        y = data['Target'].iloc[:-forecast_horizon]
+
+        if len(X) < 40:
+            return {"up_prob": 50.0, "status": "Onvoldoende trainingsdata"}
+
+        # Machine Learning Model Trainen
+        clf = RandomForestClassifier(n_estimators=100, max_depth=5, random_state=42)
+        clf.fit(X, y)
+
+        # Voorspelling doen op de allernieuwste candle
+        latest_features = data[feature_cols].iloc[[-1]]
+        probs = clf.predict_proba(latest_features)[0]  # [Prob Down, Prob Up]
+        
+        up_probability = round(probs[1] * 100, 2)
+
+        # Feature Importance ophalen
+        importances = dict(zip(feature_cols, [round(x, 3) for x in clf.feature_importances_]))
+
+        return {
+            "up_prob": up_probability,
+            "down_prob": round(100 - up_probability, 2),
+            "feature_importances": importances,
+            "status": "Succesvol"
+        }
 
     def evaluate_signals(self, df: pd.DataFrame) -> dict:
         if df.empty or len(df) < 2:
