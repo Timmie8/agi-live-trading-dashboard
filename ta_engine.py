@@ -6,6 +6,7 @@ from ta.trend import MACD
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import GridSearchCV
 
+
 class StockAnalyzer:
     def __init__(self, api_key: str = None):
         self.api_key = api_key
@@ -15,7 +16,7 @@ class StockAnalyzer:
             ticker = yf.Ticker(symbol)
             if timeframe in ['5m', '15m', '30m']:
                 period = '1mo'
-            
+
             df = ticker.history(period=period, interval=timeframe)
 
             if df.empty:
@@ -24,7 +25,7 @@ class StockAnalyzer:
             df = df.reset_index()
             time_col = 'Datetime' if 'Datetime' in df.columns else 'Date'
             df = df.rename(columns={time_col: 'Timestamp'})
-            
+
             if hasattr(df['Timestamp'].dt, 'tz_localize'):
                 df['Timestamp'] = df['Timestamp'].dt.tz_localize(None)
 
@@ -74,10 +75,10 @@ class StockAnalyzer:
         macd_bullish = latest['MACD'] > latest['MACD_Signal'] and prev['MACD'] <= prev['MACD_Signal']
         macd_status = "BULLISH CROSS" if macd_bullish else ("BULLISH" if latest['MACD'] > latest['MACD_Signal'] else "BEARISH")
 
-        # RSI Niveaus
+        # RSI Niveaus & 55 Breakout Logica
         current_rsi = latest['RSI']
         prev_rsi = prev['RSI']
-        
+
         rsi_crossed_55 = current_rsi > 55 and prev_rsi <= 55
         rsi_above_55 = current_rsi > 55
         rsi_overbought = current_rsi > 70
@@ -89,10 +90,9 @@ class StockAnalyzer:
         score = 0
         reasons = []
 
-        # 📈 NIEUW: RSI > 55 Signaal & Logica
         if rsi_crossed_55:
             score += 2
-            reasons.append("🔥 **RSI (14) BREAKOUT**: RSI is zojuist boven de 55 gestegen! (Bullish Momentum)")
+            reasons.append("🔥 **RSI (14) BREAKOUT**: RSI is zojuist boven de 55 gestegen!")
         elif rsi_above_55 and not rsi_overbought:
             score += 1
             reasons.append("✅ RSI (14) bevindt zich boven de 55 (Positieve Trend)")
@@ -114,9 +114,9 @@ class StockAnalyzer:
         if rsi_overbought:
             reasons.append("⚠️ RSI > 70 (Koers is overbought, kans op pullback)")
 
-        # 🎯 GEBASSINEERD ADVIES
+        # Advies Logica
         if rsi_overbought:
-            action = "AVOID / TAKE PROFIT (Overbought)"
+            action = "AVOID / TAKE PROFIT"
         elif rsi_above_55 and score >= 2:
             action = "STRONG BUY / BULLISH"
         elif score >= 2:
@@ -146,7 +146,7 @@ class StockAnalyzer:
         data['Target'] = (data['Close'].shift(-forecast_horizon) > data['Close']).astype(int)
 
         feature_cols = ['RSI', 'Stoch_K', 'Stoch_D', 'MACD', 'MACD_Signal', 'MACD_Hist', 'Vol_Ratio', 'Return']
-        
+
         X = data[feature_cols].iloc[:-forecast_horizon]
         y = data['Target'].iloc[:-forecast_horizon]
 
@@ -179,7 +179,7 @@ class StockAnalyzer:
 
         latest_features = data[feature_cols].iloc[[-1]]
         probs = best_clf.predict_proba(latest_features)[0]
-        
+
         up_probability = round(probs[1] * 100, 2)
         importances = dict(zip(feature_cols, [round(x, 3) for x in best_clf.feature_importances_]))
 
