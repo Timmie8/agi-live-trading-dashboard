@@ -34,16 +34,16 @@ if st.sidebar.button("Analyseer Aandeel") or ticker:
             use_grid_search=enable_grid_search
         )
 
-       # 1. Bepaal status & kleur voor de RSI badge
+        # 1. Bepaal status & kleur voor de RSI badge
         if signals.get('RSI_Overbought_Warning', False):
             rsi_status_text = f"OVERBOUGHT ({signals['RSI']})"
-            bg_color = "#FF4B4B"  # Rood - RSI is > 70 en daalt
+            bg_color = "#FF4B4B"  # Rood: RSI > 70 en daalt
             text_color = "#FFFFFF"
         elif signals.get('RSI_Stijgend_Boven_70', False):
             rsi_status_text = f"🚀 STRONG > 70 ({signals['RSI']})"
-            bg_color = "#28A745"  # Groen - RSI is > 70 en stijgt nog steeds
+            bg_color = "#28A745"  # Groen: RSI > 70 en stijgt door
             text_color = "#FFFFFF"
-        elif signals['RSI_Above_55']:
+        elif signals.get('RSI_Above_55', False):
             if signals.get('RSI_Cross_55', False):
                 rsi_status_text = f"🔥 BREAKOUT > 55 ({signals['RSI']})"
             else:
