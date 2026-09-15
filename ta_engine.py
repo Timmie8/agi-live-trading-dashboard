@@ -1,4 +1,68 @@
-def evaluate_signals(self, df: pd.DataFrame) -> dict:
+import yfinance as yf
+import pandas as pd
+import numpy as np
+from ta.momentum import RSIIndicator, StochasticOscillator
+from ta.trend import MACD
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import GridSearchCV
+
+
+class StockAnalyzer:
+    def __init__(self, api_key: str = None):
+        self.api_key = api_key
+
+    def get_stock_data(self, symbol: str, timeframe: str = "1d", period: str = "1y") -> pd.DataFrame:
+        try:
+            ticker = yf.Ticker(symbol)
+            if timeframe in ['5m', '15m', '30m']:
+                period = '1mo'
+
+            df = ticker.history(period=period, interval=timeframe)
+
+            if df.empty:
+                return pd.DataFrame()
+
+            df = df.reset_index()
+            time_col = 'Datetime' if 'Datetime' in df.columns else 'Date'
+            df = df.rename(columns={time_col: 'Timestamp'})
+
+            if hasattr(df['Timestamp'].dt, 'tz_localize'):
+                df['Timestamp'] = df['Timestamp'].dt.tz_localize(None)
+
+            return self._calculate_indicators(df)
+        except Exception as e:
+            print(f"Fout bij ophalen data voor {symbol}: {e}")
+            return pd.DataFrame()
+
+    def _calculate_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
+        if df.empty or len(df) < 26:
+            return df
+
+        # 1. RSI (14)
+        rsi_ind = RSIIndicator(close=df['Close'], window=14)
+        df['RSI'] = rsi_ind.rsi()
+
+        # 2. Slow Stochastic Oscillator
+        stoch = StochasticOscillator(high=df['High'], low=df['Low'], close=df['Close'], window=14, smooth_window=3)
+        df['Stoch_K'] = stoch.stoch()
+        df['Stoch_D'] = stoch.stoch_signal()
+
+        # 3. MACD
+        macd_ind = MACD(close=df['Close'])
+        df['MACD'] = macd_ind.macd()
+        df['MACD_Signal'] = macd_ind.macd_signal()
+        df['MACD_Hist'] = macd_ind.macd_diff()
+
+        # 4. Volume Features
+        df['Vol_SMA20'] = df['Volume'].rolling(window=20).mean()
+        df['Vol_Ratio'] = df['Volume'] / (df['Vol_SMA20'] + 1e-9)
+
+        # 5. Price Returns
+        df['Return'] = df['Close'].pct_change()
+
+        return df.dropna().reset_index(drop=True)
+
+    def evaluate_signals(self, df: pd.DataFrame) -> dict:
         if df.empty or len(df) < 2:
             return {"status": "Geen data beschikbaar"}
 
@@ -17,8 +81,8 @@ def evaluate_signals(self, df: pd.DataFrame) -> dict:
 
         rsi_crossed_55 = current_rsi > 55 and prev_rsi <= 55
         rsi_above_55 = current_rsi > 55
-        
-        # NIEUW: Overbought alleen bij DALING boven de 70
+
+        # Overbought alleen bij daling boven 70
         rsi_above_70 = current_rsi > 70
         rsi_falling = current_rsi < prev_rsi
         rsi_overbought_warning = rsi_above_70 and rsi_falling
@@ -57,7 +121,7 @@ def evaluate_signals(self, df: pd.DataFrame) -> dict:
         if rsi_overbought_warning:
             reasons.append("⚠️ RSI daalt vanaf > 70 (Momentum zwakt af, mogelijke top)")
 
-        # Advies Logica Aangepast
+        # Advies Logica
         if rsi_overbought_warning:
             action = "AVOID / TAKE PROFIT"
         elif rsi_above_55 and score >= 2:
@@ -80,4 +144,57 @@ def evaluate_signals(self, df: pd.DataFrame) -> dict:
             "MACD_Status": macd_status,
             "Action": action,
             "Reasons": reasons
+        }
+
+    def predict_ml_probability(self, df: pd.DataFrame, forecast_horizon: int = 3, use_grid_search: bool = True) -> dict:
+        if df.empty or len(df) < 60:
+            return {"up_prob": 50.0, "status": "Onvoldoende data voor ML", "best_params": {}}
+
+        data = df.copy()
+        data['Target'] = (data['Close'].shift(-forecast_horizon) > data['Close']).astype(int)
+
+        feature_cols = ['RSI', 'Stoch_K', 'Stoch_D', 'MACD', 'MACD_Signal', 'MACD_Hist', 'Vol_Ratio', 'Return']
+
+        X = data[feature_cols].iloc[:-forecast_horizon]
+        y = data['Target'].iloc[:-forecast_horizon]
+
+        if len(X) < 40:
+            return {"up_prob": 50.0, "status": "Onvoldoende trainingsdata", "best_params": {}}
+
+        rf_base = RandomForestClassifier(random_state=42)
+
+        if use_grid_search:
+            param_grid = {
+                'n_estimators': [50, 100],
+                'max_depth': [3, 5, 8],
+                'min_samples_split': [2, 5]
+            }
+
+            grid_search = GridSearchCV(
+                estimator=rf_base,
+                param_grid=param_grid,
+                cv=3,
+                scoring='roc_auc',
+                n_jobs=-1
+            )
+            grid_search.fit(X, y)
+            best_clf = grid_search.best_estimator_
+            best_params = grid_search.best_params_
+        else:
+            best_clf = RandomForestClassifier(n_estimators=100, max_depth=5, random_state=42)
+            best_clf.fit(X, y)
+            best_params = {"default": True}
+
+        latest_features = data[feature_cols].iloc[[-1]]
+        probs = best_clf.predict_proba(latest_features)[0]
+
+        up_probability = round(probs[1] * 100, 2)
+        importances = dict(zip(feature_cols, [round(x, 3) for x in best_clf.feature_importances_]))
+
+        return {
+            "up_prob": up_probability,
+            "down_prob": round(100 - up_probability, 2),
+            "best_params": best_params,
+            "feature_importances": importances,
+            "status": "Succesvol"
         }
