@@ -4,6 +4,7 @@ import numpy as np
 from ta.momentum import RSIIndicator, StochasticOscillator
 from ta.trend import MACD
 from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import GridSearchCV
 
 class StockAnalyzer:
     def __init__(self, api_key: str = None):
@@ -60,47 +61,6 @@ class StockAnalyzer:
 
         return df.dropna().reset_index(drop=True)
 
-    def predict_ml_probability(self, df: pd.DataFrame, forecast_horizon: int = 3) -> dict:
-        """
-        Traint een Random Forest Classifier om de waarschijnlijkheid van een prijsstijging
-        in de komende 'forecast_horizon' candles te voorspellen.
-        """
-        if df.empty or len(df) < 60:
-            return {"up_prob": 50.0, "status": "Onvoldoende data voor ML"}
-
-        # Target aanmaken: 1 als de prijs over N candles hoger is, anders 0
-        data = df.copy()
-        data['Target'] = (data['Close'].shift(-forecast_horizon) > data['Close']).astype(int)
-
-        # Features selecteren
-        feature_cols = ['RSI', 'Stoch_K', 'Stoch_D', 'MACD', 'MACD_Signal', 'MACD_Hist', 'Vol_Ratio', 'Return']
-        
-        X = data[feature_cols].iloc[:-forecast_horizon]
-        y = data['Target'].iloc[:-forecast_horizon]
-
-        if len(X) < 40:
-            return {"up_prob": 50.0, "status": "Onvoldoende trainingsdata"}
-
-        # Machine Learning Model Trainen
-        clf = RandomForestClassifier(n_estimators=100, max_depth=5, random_state=42)
-        clf.fit(X, y)
-
-        # Voorspelling doen op de allernieuwste candle
-        latest_features = data[feature_cols].iloc[[-1]]
-        probs = clf.predict_proba(latest_features)[0]  # [Prob Down, Prob Up]
-        
-        up_probability = round(probs[1] * 100, 2)
-
-        # Feature Importance ophalen
-        importances = dict(zip(feature_cols, [round(x, 3) for x in clf.feature_importances_]))
-
-        return {
-            "up_prob": up_probability,
-            "down_prob": round(100 - up_probability, 2),
-            "feature_importances": importances,
-            "status": "Succesvol"
-        }
-
     def evaluate_signals(self, df: pd.DataFrame) -> dict:
         if df.empty or len(df) < 2:
             return {"status": "Geen data beschikbaar"}
@@ -114,7 +74,14 @@ class StockAnalyzer:
         macd_bullish = latest['MACD'] > latest['MACD_Signal'] and prev['MACD'] <= prev['MACD_Signal']
         macd_status = "BULLISH CROSS" if macd_bullish else ("BULLISH" if latest['MACD'] > latest['MACD_Signal'] else "BEARISH")
 
-        rsi_overbought = latest['RSI'] > 70
+        # RSI Niveaus
+        current_rsi = latest['RSI']
+        prev_rsi = prev['RSI']
+        
+        rsi_crossed_55 = current_rsi > 55 and prev_rsi <= 55
+        rsi_above_55 = current_rsi > 55
+        rsi_overbought = current_rsi > 70
+
         vol_avg = latest['Vol_SMA20'] if not pd.isna(latest['Vol_SMA20']) else 1
         vol_strong = latest['Volume'] > vol_avg * 1.5
         price_change_pct = ((latest['Close'] - prev['Close']) / prev['Close']) * 100
@@ -122,12 +89,22 @@ class StockAnalyzer:
         score = 0
         reasons = []
 
+        # 📈 NIEUW: RSI > 55 Signaal & Logica
+        if rsi_crossed_55:
+            score += 2
+            reasons.append("🔥 **RSI (14) BREAKOUT**: RSI is zojuist boven de 55 gestegen! (Bullish Momentum)")
+        elif rsi_above_55 and not rsi_overbought:
+            score += 1
+            reasons.append("✅ RSI (14) bevindt zich boven de 55 (Positieve Trend)")
+
         if sto_bullish or latest['Stoch_K'] > latest['Stoch_D']:
             score += 1
             reasons.append("STO wijst omhoog (Korte termijn momentum)")
+
         if macd_bullish or latest['MACD'] > latest['MACD_Signal']:
             score += 1
             reasons.append("MACD is bullish (Kruising/Trend omhoog)")
+
         if vol_strong and price_change_pct > 0:
             score += 1
             reasons.append("Hoge stijging ondersteund door STERK volume")
@@ -137,16 +114,79 @@ class StockAnalyzer:
         if rsi_overbought:
             reasons.append("⚠️ RSI > 70 (Koers is overbought, kans op pullback)")
 
-        action = "BUY / WATCH" if score >= 2 and not rsi_overbought else ("AVOID / CAUTION" if rsi_overbought else "WAIT")
+        # 🎯 GEBASSINEERD ADVIES
+        if rsi_overbought:
+            action = "AVOID / TAKE PROFIT (Overbought)"
+        elif rsi_above_55 and score >= 2:
+            action = "STRONG BUY / BULLISH"
+        elif score >= 2:
+            action = "BUY / WATCH"
+        else:
+            action = "HOLD / WAIT (RSI < 55)"
 
         return {
             "Price": latest['Close'],
             "Change_Pct": round(price_change_pct, 2),
             "Volume": latest['Volume'],
-            "RSI": round(latest['RSI'], 1) if not pd.isna(latest['RSI']) else 0,
+            "RSI": round(current_rsi, 1) if not pd.isna(current_rsi) else 0,
+            "RSI_Cross_55": rsi_crossed_55,
+            "RSI_Above_55": rsi_above_55,
             "STO_Status": sto_status,
             "MACD_Status": macd_status,
             "RSI_Overbought": rsi_overbought,
             "Action": action,
             "Reasons": reasons
+        }
+
+    def predict_ml_probability(self, df: pd.DataFrame, forecast_horizon: int = 3, use_grid_search: bool = True) -> dict:
+        if df.empty or len(df) < 60:
+            return {"up_prob": 50.0, "status": "Onvoldoende data voor ML", "best_params": {}}
+
+        data = df.copy()
+        data['Target'] = (data['Close'].shift(-forecast_horizon) > data['Close']).astype(int)
+
+        feature_cols = ['RSI', 'Stoch_K', 'Stoch_D', 'MACD', 'MACD_Signal', 'MACD_Hist', 'Vol_Ratio', 'Return']
+        
+        X = data[feature_cols].iloc[:-forecast_horizon]
+        y = data['Target'].iloc[:-forecast_horizon]
+
+        if len(X) < 40:
+            return {"up_prob": 50.0, "status": "Onvoldoende trainingsdata", "best_params": {}}
+
+        rf_base = RandomForestClassifier(random_state=42)
+
+        if use_grid_search:
+            param_grid = {
+                'n_estimators': [50, 100],
+                'max_depth': [3, 5, 8],
+                'min_samples_split': [2, 5]
+            }
+
+            grid_search = GridSearchCV(
+                estimator=rf_base,
+                param_grid=param_grid,
+                cv=3,
+                scoring='roc_auc',
+                n_jobs=-1
+            )
+            grid_search.fit(X, y)
+            best_clf = grid_search.best_estimator_
+            best_params = grid_search.best_params_
+        else:
+            best_clf = RandomForestClassifier(n_estimators=100, max_depth=5, random_state=42)
+            best_clf.fit(X, y)
+            best_params = {"default": True}
+
+        latest_features = data[feature_cols].iloc[[-1]]
+        probs = best_clf.predict_proba(latest_features)[0]
+        
+        up_probability = round(probs[1] * 100, 2)
+        importances = dict(zip(feature_cols, [round(x, 3) for x in best_clf.feature_importances_]))
+
+        return {
+            "up_prob": up_probability,
+            "down_prob": round(100 - up_probability, 2),
+            "best_params": best_params,
+            "feature_importances": importances,
+            "status": "Succesvol"
         }
