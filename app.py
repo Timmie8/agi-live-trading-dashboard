@@ -61,6 +61,5 @@ with m6:
     st.metric("🤖 ML Kans (+{forecast_horizon}d)", f"{ml_res['up_prob']}%")
 
 st.markdown("---")
-
     res_df = pd.DataFrame(results)
     st.dataframe(res_df, use_container_width=True)
